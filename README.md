@@ -10,8 +10,8 @@
 ## on macOS and Linux
 'source myenv/bin/activate'
 
-## install all packages 
-'pip install -r requirements.txt'
+## install all packages
+'pip install -r requirements.txt' or manually with 'pip install torch torchvision matplotlib' 
 
 ## Get the dataset from hugging face
 TBD
