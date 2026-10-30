@@ -1,14 +1,14 @@
 # install
 # Create a virtual environment 
-'python -m venv myenv'
+'python -m venv .venv'
 
 # Set up the virtual environment & data
 
 ##  on Windows
-'myenv\Scripts\activate'
+'.venv\Scripts\activate'
 
 ## on macOS and Linux
-'source myenv/bin/activate'
+'source .venv/bin/activate'
 
 ## install all packages
 'pip install -r requirements.txt' or manually with 'pip install torch torchvision matplotlib' 
