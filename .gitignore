@@ -1,3 +1,8 @@
+#DATASET images
+DATASET/*
+Test_Images/*
+Test_Images_easy/*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
