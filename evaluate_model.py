@@ -6,7 +6,8 @@ from sympy import false
 import torch
 import matplotlib.pyplot as plt
 
-from LaborGlassModel import ImageClassifier_resnet50
+import labor_glass_model
+from labor_glass_model import ImageClassifier_resnet50
 from image_transforms import  make_transforms
 from shared import  get_image_width, get_image_height
 
@@ -14,14 +15,12 @@ from sklearn.metrics import confusion_matrix
 import seaborn as sns
 from PIL import Image, ImageOps
 
-import image_classifier
-
 import logging
 low_threshold=0
 
 logger = logging.getLogger(__name__)
 
-RESNET50_ARCHITECTURES = {image_classifier.ARCHITECTURE}
+RESNET50_ARCHITECTURES = {"resnet50"}
 
 def print_confusion_matrix(all_labels, all_preds, class_names,postfix):
     # based on https://github.com/MaitreyaM/Detailed-Image-Classification-Pytorch/blob/main/VGG19_classification.ipynb
@@ -43,7 +42,7 @@ def get_model( model_path: Path,device):
     checkpoint = torch.load(model_path, map_location=device)
     if checkpoint.get("architecture") in RESNET50_ARCHITECTURES:
         # Checkpoint from image_classifier.py: reuse its model and preprocessing.
-        model, classes = image_classifier.load_model(model_path, device)
+        model, classes = labor_glass_model.load_model(model_path, device)
         return model, classes
     classes = checkpoint["classes"]
     model = ImageClassifier_resnet50(len(classes)).to(device) #ImageClassifier_Resnet18(len(classes)).to(device)
@@ -56,7 +55,7 @@ def classify_image(image_path: Path, model,device,classes) :
         raise FileNotFoundError(f"Image not found: {image_path}")
 
     if isinstance(model,ImageClassifier_resnet50):
-        probabilities = image_classifier.predict_probabilities(model, image_path, device)
+        probabilities = labor_glass_model.predict_probabilities(model, image_path, device)
     else:
         image_transform = make_transforms(get_image_height(),get_image_width(),false)
         with Image.open(image_path) as image:

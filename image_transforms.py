@@ -1,32 +1,12 @@
-import torchvision
-from PIL import Image
+
+
 from torchvision import transforms
 
-from image_tool import get_image_size
+from image_tool import get_image_size, PadToSquare, PAD_FILL
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-PAD_FILL = (124, 116, 104)
 
-
-
-def _pad_to_square(image: Image.Image, fill) -> Image.Image:
-    width, height = image.size
-    if width == height:
-        return image
-    side = max(width, height)
-    canvas = Image.new(image.mode, (side, side), fill)
-    canvas.paste(image, ((side - width) // 2, (side - height) // 2))
-    return canvas
-
-class PadToSquare:
-    """Letterbox to a square so tall phone photos are not squashed."""
-
-    def __init__(self, fill: tuple[int, int, int] = PAD_FILL) -> None:
-        self.fill = fill
-
-    def __call__(self, image: Image.Image) -> Image.Image:
-        return _pad_to_square(image, self.fill)
 
 def make_transforms(training: bool = False) -> transforms.Compose:
     if training:

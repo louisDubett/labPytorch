@@ -1,7 +1,12 @@
 import torch
 import torch.nn as nn
 from torchvision import models
-from torchvision.models import ResNet18_Weights
+
+from pathlib import Path
+
+from image_tool import load_image
+from image_transforms import make_transforms
+
 
 class ImageClassifier_resnet50(nn.Module):
     def __init__(self, num_classes: int, pretrained: bool = False, dropout: float = 0.3) -> None:
@@ -84,3 +89,32 @@ class ImageClassifier_raw(nn.Module):
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         return self.classifier(self.features(images))
+
+# ------------------------------------------------------------------------- inference
+
+def predict_probabilities(
+        model: ImageClassifier_resnet50, image_path: Path, device: torch.device, tta: bool = True
+) -> torch.Tensor:
+    """Class probabilities for one image, averaged over the image and its mirror when ``tta``."""
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    tensor = make_transforms()(load_image(image_path))
+    batch = torch.stack([tensor, tensor.flip(-1)]) if tta else tensor.unsqueeze(0)
+    with torch.no_grad():
+        return torch.softmax(model(batch.to(device)), dim=1).mean(dim=0)
+
+def load_model(model_path: Path, device: torch.device) -> tuple[ImageClassifier_resnet50, list[str]]:
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Model not found at {model_path}. Train one first with -train.")
+    checkpoint = torch.load(model_path, map_location=device)
+    ARCHITECTURE = "resnet50"
+    if checkpoint.get("architecture") not in {ARCHITECTURE}:
+        raise ValueError(
+            "This model checkpoint was not created with ResNet-50. "
+            "Train a new model with -train before classifying images."
+        )
+    classes = checkpoint["classes"]
+    model = ImageClassifier_resnet50(len(classes)).to(device)
+    model.load_checkpoint_state(checkpoint["model_state"])
+    model.eval()
+    return model, classes
