@@ -2,15 +2,13 @@ import torchvision
 from PIL import Image
 from torchvision import transforms
 
-
-IMAGE_SIZE = 224
+from image_tool import get_image_size
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 PAD_FILL = (124, 116, 104)
 
-def get_image_size():
-    return IMAGE_SIZE
+
 
 def _pad_to_square(image: Image.Image, fill) -> Image.Image:
     width, height = image.size
@@ -34,7 +32,7 @@ def make_transforms(training: bool = False) -> transforms.Compose:
     if training:
         image_transforms = [
             PadToSquare(),
-            transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.6, 1.0), ratio=(0.8, 1.25)),
+            transforms.RandomResizedCrop(get_image_size(), scale=(0.6, 1.0), ratio=(0.8, 1.25)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomApply([transforms.RandomRotation(20, fill=PAD_FILL)], p=0.5),
             transforms.RandomPerspective(distortion_scale=0.3, p=0.3, fill=PAD_FILL),
@@ -48,7 +46,7 @@ def make_transforms(training: bool = False) -> transforms.Compose:
     else:
         image_transforms = [
             PadToSquare(),
-            transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+            transforms.Resize((get_image_size(), get_image_size())),
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]

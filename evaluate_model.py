@@ -1,6 +1,4 @@
 import argparse
-import os
-import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -8,19 +6,22 @@ from sympy import false
 import torch
 import matplotlib.pyplot as plt
 
-from LaborGlassModel import ImageClassifier_Resnet18, ImageClassifier_vgg19, ImageClassifier_resnet50
+from LaborGlassModel import ImageClassifier_resnet50
 from image_transforms import  make_transforms
 from shared import  get_image_width, get_image_height
-import numpy as np
+
 from sklearn.metrics import confusion_matrix
 import seaborn as sns
 from PIL import Image, ImageOps
+
+import image_classifier
 
 import logging
 low_threshold=0
 
 logger = logging.getLogger(__name__)
 
+RESNET50_ARCHITECTURES = {image_classifier.ARCHITECTURE}
 
 def print_confusion_matrix(all_labels, all_preds, class_names,postfix):
     # based on https://github.com/MaitreyaM/Detailed-Image-Classification-Pytorch/blob/main/VGG19_classification.ipynb
@@ -40,15 +41,12 @@ def get_model( model_path: Path,device):
         )
 
     checkpoint = torch.load(model_path, map_location=device)
-    RESNET50_ARCHITECTURES = "resnet50"
-    RESNET18_ARCHITECTURES = "resnet18"
-
     if checkpoint.get("architecture") in RESNET50_ARCHITECTURES:
         # Checkpoint from image_classifier.py: reuse its model and preprocessing.
-        model, classes = ImageClassifier_resnet50.load_model(model_path, device)
+        model, classes = image_classifier.load_model(model_path, device)
         return model, classes
     classes = checkpoint["classes"]
-    model = ImageClassifier_vgg19(len(classes)).to(device) #ImageClassifier_Resnet18(len(classes)).to(device)
+    model = ImageClassifier_resnet50(len(classes)).to(device) #ImageClassifier_Resnet18(len(classes)).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model,classes
@@ -57,10 +55,10 @@ def classify_image(image_path: Path, model,device,classes) :
     if not image_path.is_file():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    if isinstance(model, ImageClassifier_resnet50.ImageClassifier):
-        probabilities = ImageClassifier_resnet50.predict_probabilities(model, image_path, device)
+    if isinstance(model,ImageClassifier_resnet50):
+        probabilities = image_classifier.predict_probabilities(model, image_path, device)
     else:
-        image_transform = make_transforms(false)
+        image_transform = make_transforms(get_image_height(),get_image_width(),false)
         with Image.open(image_path) as image:
             image_tensor = image_transform(image.convert("RGB")).unsqueeze(0).to(device)
 
@@ -77,8 +75,8 @@ def classify_image(image_path: Path, model,device,classes) :
 def normalize_root_dir_value(raw_root: str) -> str:
     return raw_root.strip().strip('"').strip("'")
 
-def evaluate_model(config_path: str, 
-                   model_path: str, 
+def evaluate_model(config_path: str,
+                   model_path: str,
                    output_path: str  ) -> str:
     config_file = Path(config_path)
     if not config_file.exists():
