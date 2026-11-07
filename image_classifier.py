@@ -1,80 +1,228 @@
+"""Fine-tune a ResNet-50 on DATASET/TRAIN + DATASET/VAL and classify images.
+
+The training images are background-removed cutouts (RGBA, mostly transparent) that fill
+the frame, while the real test photos (Test_Images) are large phone pictures of small
+glassware on a desk, with real backgrounds, portrait orientation and EXIF rotation.
+The data pipeline below is built to close that gap: cutouts are zoomed out and
+composited onto randomised backgrounds, images are letterboxed instead of squashed,
+EXIF orientation is honoured and augmentation is aggressive.
+"""
+
 import argparse
+import hashlib
+import json
+import math
+import random
+import time
 from pathlib import Path
 
-import torch
-from PIL import Image
-from torch import nn
-from torch.utils.data import DataLoader
-from torchvision import datasets, models, transforms
+import matplotlib
+
+from LaborGlassModel import ImageClassifier_resnet50
+from image_transforms import get_image_size, _pad_to_square, make_transforms
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from PIL import Image, ImageFile, ImageOps
+from torch import nn
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torchvision import datasets, models, transforms
+from torchvision.transforms import v2
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 BASE_DIR = Path(__file__).resolve().parent
 TRAIN_DIR = BASE_DIR / "DATASET" / "TRAIN"
 VAL_DIR = BASE_DIR / "DATASET" / "VAL"
 MODEL_PATH = BASE_DIR / "model.pth"
-IMAGE_SIZE = 224
+HISTORY_PATH = BASE_DIR / "training_history.json"
 
-# The batch size in a DataLoader determines how many samples are processed together in one iteration during training.
-# Common practice suggests using a batch size between 8 and 128, depending on the dataset and model requirements.
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 EPOCHS = 30
-EARLY_STOPPING_PATIENCE = 6
-ARCHITECTURE = "vgg19"
+FREEZE_EPOCHS = 4
+BACKBONE_LR = 3e-5
+HEAD_LR = 1e-3
+WEIGHT_DECAY = 0.05
+LABEL_SMOOTHING = 0.5
+PATIENCE = 8
+MIX_PROBABILITY = 0.5
+ZOOM_OUT_PROBABILITY = 0.6
+ARCHITECTURE = "resnet50"
+LEGACY_ARCHITECTURE = "resnet18"
 
 
-# ARCHITECTURE = "resnet18"
-# https://github.com/MaitreyaM/Detailed-Image-Classification-Pytorch/blob/main/VGG19_classification.ipynb
-# num_features=vgg19.classifier[6].in_features
-# vgg19.classifier[6]=nn.Linear(num_features,6)
-# vgg19=vgg19.to(device)
-# criterion=nn.CrossEntropyLoss()
-# optimizer=optim.Adam(vgg19.classifier[6].parameters(),lr=0.001)
+# Letterbox colour: ImageNet mean, so padding is "neutral" after normalisation.
 
-class ImageClassifier(nn.Module):
-    def __init__(self, num_classes: int, pretrained: bool = False) -> None:
-        super().__init__()
-        weights = models.VGG19_Weights.DEFAULT if pretrained else None
-        self.network = models.vgg19(weights=weights)
-        self.network.classifier[6] = nn.Linear(
-            self.network.classifier[6].in_features, num_classes
-        )
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        return self.network(images)
+EVAL_BACKGROUND = (255, 255, 255)
+IMAGE_EXTENSIONS = tuple(datasets.folder.IMG_EXTENSIONS)
 
 
-def make_transforms(training: bool = False) -> transforms.Compose:
-    image_transforms = []
-    if training:
-        image_transforms.extend(
-            [
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomRotation(10),
-                transforms.ColorJitter(brightness=0.15, contrast=0.15),
-            ]
-        )
-    image_transforms.extend(
-        [
-            transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-            # TODO test with transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=(0.485, 0.456, 0.406),
-                std=(0.229, 0.224, 0.225),
-            ),
-        ]
+
+
+# --------------------------------------------------------------------------- images
+
+
+def _random_background(size: tuple[int, int], rng) -> Image.Image:
+    """Solid, gradient or noisy background so the model cannot rely on a black/transparent one."""
+    width, height = size
+    first = np.array([rng.randint(0, 255) for _ in range(3)], dtype=np.float32)
+    second = np.array([rng.randint(0, 255) for _ in range(3)], dtype=np.float32)
+    kind = rng.random()
+    if kind < 0.4:
+        blend = np.zeros((height, width, 1), dtype=np.float32)
+    elif kind < 0.7:
+        blend = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None, None].repeat(width, 1)
+    else:
+        ys = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]
+        xs = np.linspace(0.0, 1.0, width, dtype=np.float32)[None, :]
+        blend = ((xs + ys) / 2.0)[:, :, None]
+    pixels = first * (1.0 - blend) + second * blend
+    noise_rng = np.random.default_rng(rng.getrandbits(32))
+    pixels += noise_rng.normal(0.0, rng.uniform(0.0, 20.0), pixels.shape).astype(np.float32)
+    pixels = np.clip(pixels, 0, 255).astype(np.uint8)
+    return Image.fromarray(pixels, "RGB").convert("RGBA")
+
+
+def _has_transparency(image: Image.Image) -> bool:
+    return image.mode in ("RGBA", "LA", "PA") or (
+        image.mode == "P" and "transparency" in image.info
     )
-    return transforms.Compose(image_transforms)
 
 
-def train_model() -> None:
+
+
+def _zoom_out(image: Image.Image, rng, min_scale: float = 0.3) -> Image.Image:
+    """Shrink a square RGBA image and drop it somewhere on a transparent canvas of the same size.
+
+    Test photos show small glassware on a desk; the cutouts fill the whole frame.
+    The object centre stays in the middle half of the canvas so later random crops keep it.
+    """
+    side = image.width
+    new_side = max(1, int(side * rng.uniform(min_scale, 1.0)))
+    small = image.resize((new_side, new_side), Image.BILINEAR)
+    low = max(0, side // 4 - new_side // 2)
+    high = max(low, min(side - new_side, 3 * side // 4 - new_side // 2))
+    canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    canvas.paste(small, (rng.randint(low, high), rng.randint(low, high)))
+    return canvas
+
+
+def load_image(path: Path, rng=None, zoom_out_probability: float = 0.0) -> Image.Image:
+    """Open an image as RGB, honouring EXIF rotation.
+
+    Inference (``rng`` is None): transparent pixels are composited onto white.
+    Training/validation: the image is padded to a square, optionally zoomed out and
+    composited onto a randomised background so a transparent/black background,
+    the aspect ratio and the object scale cannot be used as shortcuts.
+    """
+    with Image.open(path) as image:
+        if image.format == "JPEG":
+            # Phone photos are huge; let the decoder downscale cheaply first.
+            image.draft("RGB", (get_image_size() * 3, get_image_size() * 3))
+        image = ImageOps.exif_transpose(image)
+        if rng is None:
+            if _has_transparency(image):
+                image = image.convert("RGBA")
+                background = Image.new("RGBA", image.size, EVAL_BACKGROUND + (255,))
+                image = Image.alpha_composite(background, image)
+            return image.convert("RGB")
+        image = _pad_to_square(image.convert("RGBA"), (0, 0, 0, 0))
+        if rng.random() < zoom_out_probability:
+            image = _zoom_out(image, rng)
+        return Image.alpha_composite(_random_background(image.size, rng), image).convert("RGB")
+
+
+
+
+
+
+
+class ReadableImageFilter:
+    """ImageFolder ``is_valid_file`` hook that drops unreadable/corrupt files and remembers them."""
+
+    def __init__(self) -> None:
+        self.skipped: list[str] = []
+
+    def __call__(self, path: str) -> bool:
+        if not path.lower().endswith(IMAGE_EXTENSIONS):
+            return False
+        try:
+            with Image.open(path) as image:
+                image.verify()
+        except Exception:
+            self.skipped.append(path)
+            return False
+        return True
+
+
+class GlasswareDataset(datasets.ImageFolder):
+    def __init__(self, root: Path, training: bool) -> None:
+        self.filter = ReadableImageFilter()
+        super().__init__(str(root), transform=make_transforms(training), is_valid_file=self.filter)
+        self.training = training
+
+    def __getitem__(self, index: int):
+        path, target = self.samples[index]
+        if self.training:
+            rng = random
+        else:
+            # Stable per-file background/zoom so validation numbers are comparable across epochs.
+            digest = hashlib.md5(path.encode("utf-8")).hexdigest()
+            rng = random.Random(int(digest[:8], 16))
+        image = load_image(Path(path), rng, ZOOM_OUT_PROBABILITY)
+        return self.transform(image), target
+
+    def class_counts(self) -> list[int]:
+        counts = [0] * len(self.classes)
+        for _, target in self.samples:
+            counts[target] += 1
+        return counts
+
+
+# -------------------------------------------------------------------------- training
+
+
+def _set_backbone_trainable(model: ImageClassifier_resnet50, trainable: bool) -> None:
+    for parameter in model.backbone_parameters():
+        parameter.requires_grad_(trainable)
+
+
+def _evaluate(model, loader, loss_function, device, num_classes, use_amp):
+    model.eval()
+    confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
+    total_loss = 0.0
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            with torch.autocast(device_type=device.type, enabled=use_amp):
+                outputs = model(images)
+                loss = loss_function(outputs, labels)
+            total_loss += loss.item() * images.size(0)
+            predictions = outputs.argmax(dim=1)
+            for actual, predicted in zip(labels.cpu(), predictions.cpu()):
+                confusion[actual, predicted] += 1
+    total = int(confusion.sum().item())
+    accuracy = confusion.diag().sum().item() / max(total, 1)
+    per_class_recall = confusion.diag().float() / confusion.sum(dim=1).clamp(min=1).float()
+    balanced_accuracy = per_class_recall.mean().item()
+    return total_loss / max(total, 1), accuracy, balanced_accuracy, confusion
+
+
+def train_model(args: argparse.Namespace) -> None:
     if not TRAIN_DIR.is_dir() or not VAL_DIR.is_dir():
         raise FileNotFoundError(
             f"Expected training and validation folders at {TRAIN_DIR} and {VAL_DIR}."
         )
 
-    train_dataset = datasets.ImageFolder(TRAIN_DIR, transform=make_transforms(True))
-    val_dataset = datasets.ImageFolder(VAL_DIR, transform=make_transforms())
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    train_dataset = GlasswareDataset(TRAIN_DIR, training=True)
+    val_dataset = GlasswareDataset(VAL_DIR, training=False)
     if not train_dataset.classes:
         raise ValueError(f"No class folders found in {TRAIN_DIR}.")
     if train_dataset.classes != val_dataset.classes:
@@ -82,184 +230,229 @@ def train_model() -> None:
             "Training and validation folders must contain the same class folders. "
             f"Training: {train_dataset.classes}; validation: {val_dataset.classes}"
         )
+    skipped = train_dataset.filter.skipped + val_dataset.filter.skipped
+    if skipped:
+        print(f"Skipped {len(skipped)} unreadable image files:")
+        for path in skipped:
+            print(f"  {path}")
 
-    num_classes = len(train_dataset.classes)
-    train_class_counts = torch.bincount(
-        torch.tensor(train_dataset.targets), minlength=num_classes
-    )
-    val_class_counts = torch.bincount(
-        torch.tensor(val_dataset.targets), minlength=num_classes
-    )
-    if (train_class_counts == 0).any() or (val_class_counts == 0).any():
-        raise ValueError(
-            "Every class must contain images in both training and validation."
-        )
-
+    classes = train_dataset.classes
+    num_classes = len(classes)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    model = ImageClassifier(num_classes, pretrained=True).to(device)
-    class_weights = (
-            len(train_dataset) / (num_classes * train_class_counts.float())
-    ).to(device)
-    loss_function = nn.CrossEntropyLoss(weight=class_weights)
-    backbone_parameters = [
-        parameter
-        for name, parameter in model.network.named_parameters()
-        if not name.startswith("classifier.6.")
-    ]
+    use_amp = device.type == "cuda" and not args.no_amp
+
+    # Oversample rare classes so every class is seen equally often.
+    class_counts = train_dataset.class_counts()
+    sample_weights = [1.0 / class_counts[target] for _, target in train_dataset.samples]
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(train_dataset), replacement=True)
+    loader_options = dict(
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.workers > 0,
+    )
+    train_loader = DataLoader(train_dataset, sampler=sampler, drop_last=True, **loader_options)
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_options)
+
+    model = ImageClassifier_resnet50(num_classes, pretrained=True).to(device)
+    loss_function = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    mixer = v2.RandomChoice([v2.CutMix(num_classes=num_classes), v2.MixUp(num_classes=num_classes, alpha=0.4)])
     optimizer = torch.optim.AdamW(
         [
-            {"params": backbone_parameters, "lr": 1e-5},
-            {"params": model.network.classifier[6].parameters(), "lr": 1e-3},
+            {"params": model.backbone_parameters(), "lr": args.backbone_lr, "weight_decay": WEIGHT_DECAY},
+            {"params": model.head_parameters(), "lr": args.head_lr, "weight_decay": 1e-4},
         ]
     )
-    # ReduceLROnPlateau is a learning rate scheduler used in machine learning to adjust
-    # the learning rate based on the performance of a model.
-    # It is particularly useful when training models that may experience plateaus
-    # in their learning process.
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",  # The learning rate is reduced when the monitored metric stops decreasing.
-        factor=0.2,  # , the new learning rate will be 20% of the current rate.
-        patience=2,  # Number of epochs with no improvement after which learning rate will be reduced.
-        min_lr=1e-7  # The lower bound on the learning rate.
-    )
+    warmup_epochs = max(args.freeze_epochs, 1)
+
+    def lr_lambda(epoch: int) -> float:
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(args.epochs - warmup_epochs, 1)
+        return 0.02 + 0.98 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+
+    history = []
     best_balanced_accuracy = -1.0
-    best_validation_accuracy = 0.0
+    best_epoch = 0
+    best_confusion = None
     epochs_without_improvement = 0
 
-    # store for printing
-    losses = []
-    accuracies = []
-    validation_losses = []
+    print(
+        f"Training on {device}{' with AMP' if use_amp else ''}; "
+        f"{len(train_dataset)} train / {len(val_dataset)} val images; classes: {', '.join(classes)}"
+    )
+    print(f"Train class counts: {dict(zip(classes, class_counts))}")
 
-    print(f"Training on {device}; classes: {', '.join(train_dataset.classes)}")
-    for epoch in range(EPOCHS):
+    for epoch in range(args.epochs):
+        started = time.time()
+        backbone_trainable = epoch >= args.freeze_epochs
+        _set_backbone_trainable(model, backbone_trainable)
         model.train()
         total_loss = 0.0
-        total_loss_weight = 0.0
+        train_correct = 0
+        train_seen = 0
         for images, labels in train_loader:
-            images, labels = images.to(device), labels.to(device)
-            optimizer.zero_grad()
-            loss = loss_function(model(images), labels)
-            loss.backward()
-            optimizer.step()
-            batch_weight = class_weights[labels].sum().item()
-            total_loss += loss.item() * batch_weight
-            total_loss_weight += batch_weight
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            targets = labels
+            if not args.no_mix and random.random() < MIX_PROBABILITY:
+                images, targets = mixer(images, labels)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, enabled=use_amp):
+                outputs = model(images)
+                loss = loss_function(outputs, targets)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.item() * images.size(0)
+            train_correct += (outputs.argmax(dim=1) == labels).sum().item()
+            train_seen += images.size(0)
 
-        model.eval()
-        correct = 0
-        validation_class_correct = torch.zeros(num_classes, dtype=torch.long)
-        validation_loss_total = 0.0
-        validation_loss_weight = 0.0
-        with torch.no_grad():
-            for images, labels in val_loader:
-                labels_on_device = labels.to(device)
-                outputs = model(images.to(device))
-                batch_weight = class_weights[labels_on_device].sum().item()
-                validation_loss_total += loss_function(
-                    outputs, labels_on_device
-                ).item() * batch_weight
-                validation_loss_weight += batch_weight
-                predictions = outputs.argmax(dim=1).cpu()
-                matches = predictions == labels
-                correct += matches.sum().item()
-                validation_class_correct += torch.bincount(
-                    labels[matches], minlength=num_classes
-                )
+        val_loss, val_accuracy, val_balanced_accuracy, confusion = _evaluate(
+            model, val_loader, loss_function, device, num_classes, use_amp
+        )
+        learning_rates = [group["lr"] for group in optimizer.param_groups]
+        scheduler.step()
 
-        validation_accuracy = correct / len(val_dataset)
-        balanced_accuracy = (
-                validation_class_correct.float() / val_class_counts
-        ).mean().item()
-        average_loss = total_loss / total_loss_weight
-        average_validation_loss = validation_loss_total / validation_loss_weight
-        losses.append(average_loss)
-        accuracies.append(validation_accuracy)
-        validation_losses.append(average_validation_loss)
-        scheduler.step(average_validation_loss)
-
+        train_loss = total_loss / max(train_seen, 1)
+        train_accuracy = train_correct / max(train_seen, 1)
+        history.append(
+            {
+                "epoch": epoch + 1,
+                "train_loss": train_loss,
+                "train_accuracy": train_accuracy,
+                "val_loss": val_loss,
+                "val_accuracy": val_accuracy,
+                "val_balanced_accuracy": val_balanced_accuracy,
+                "backbone_trainable": backbone_trainable,
+                "learning_rates": learning_rates,
+                "seconds": time.time() - started,
+            }
+        )
         print(
-            f"Epoch {epoch + 1}/{EPOCHS} - "
-            f"loss: {average_loss:.4f} - val loss: {average_validation_loss:.4f} - "
-            f"val accuracy: {validation_accuracy:.1%} - "
-            f"balanced accuracy: {balanced_accuracy:.1%}"
+            f"Epoch {epoch + 1}/{args.epochs} ({time.time() - started:.0f}s) - "
+            f"loss: {train_loss:.4f} - train accuracy: {train_accuracy:.1%} - "
+            f"val loss: {val_loss:.4f} - val accuracy: {val_accuracy:.1%} - "
+            f"val balanced accuracy: {val_balanced_accuracy:.1%}"
+            f"{' (backbone frozen)' if not backbone_trainable else ''}"
         )
 
-        if balanced_accuracy > best_balanced_accuracy:
-            best_balanced_accuracy = balanced_accuracy
-            best_validation_accuracy = validation_accuracy
+        if val_balanced_accuracy > best_balanced_accuracy:
+            best_balanced_accuracy = val_balanced_accuracy
+            best_epoch = epoch + 1
+            best_confusion = confusion.tolist()
             epochs_without_improvement = 0
             torch.save(
                 {
                     "architecture": ARCHITECTURE,
                     "model_state": model.state_dict(),
-                    "classes": train_dataset.classes,
-                    "image_size": IMAGE_SIZE,
+                    "classes": classes,
+                    "image_size": get_image_size(),
+                    "preprocessing": "letterbox",
+                    "epoch": best_epoch,
+                    "validation_accuracy": val_accuracy,
+                    "balanced_validation_accuracy": val_balanced_accuracy,
                 },
-                MODEL_PATH,
+                args.model,
             )
         else:
             epochs_without_improvement += 1
-            if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
-                print(f"Early stopping after {epoch + 1} epochs.")
+            if args.patience and epochs_without_improvement >= args.patience:
+                print(f"No improvement for {args.patience} epochs; stopping early.")
                 break
 
-    print(f"Best validation balanced accuracy: {best_balanced_accuracy:.1%}")
-    print(f"Accuracy at selected checkpoint: {best_validation_accuracy:.1%}")
-    print(f"Model saved to {MODEL_PATH}")
+    print(f"Best balanced validation accuracy: {best_balanced_accuracy:.1%} (epoch {best_epoch})")
+    print(f"Model saved to {args.model}")
 
-    epochs = range(1, len(losses) + 1)
-    plt.plot(epochs, losses, marker="o", label="Training")
-    plt.plot(epochs, validation_losses, marker="o", label="Validation")
-    plt.title("Training Loss Curve")
+    HISTORY_PATH.write_text(
+        json.dumps(
+            {
+                "classes": classes,
+                "best_epoch": best_epoch,
+                "best_balanced_validation_accuracy": best_balanced_accuracy,
+                "confusion_matrix_best_epoch": best_confusion,
+                "skipped_files": skipped,
+                "epochs": history,
+            },
+            indent=2,
+        )
+    )
+    _plot_history(history)
+
+
+def _plot_history(history: list[dict]) -> None:
+    epochs = [entry["epoch"] for entry in history]
+    plt.figure()
+    plt.plot(epochs, [e["train_loss"] for e in history], marker="o", label="Training")
+    plt.plot(epochs, [e["val_loss"] for e in history], marker="o", label="Validation")
+    plt.title("Training and Validation Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.grid(True)
     plt.legend()
-    plt.savefig("training_loss_curve.png")
+    plt.savefig(BASE_DIR / "training_loss_curve.png")
     plt.close()
 
-    plt.plot(epochs, accuracies, marker="o")
-    plt.title("accuracy Curve")
+    plt.figure()
+    plt.plot(epochs, [e["train_accuracy"] for e in history], marker="o", label="Training")
+    plt.plot(epochs, [e["val_accuracy"] for e in history], marker="o", label="Validation")
+    plt.plot(
+        epochs,
+        [e["val_balanced_accuracy"] for e in history],
+        marker="s",
+        linestyle="--",
+        label="Validation (balanced)",
+    )
+    plt.title("Training and Validation Accuracy")
     plt.xlabel("Epoch")
-    plt.ylabel("accuracy")
+    plt.ylabel("Accuracy")
     plt.grid(True)
-    plt.savefig("training_accuracy.png")
+    plt.legend()
+    plt.savefig(BASE_DIR / "training_accuracy.png")
     plt.close()
 
 
-# plt.show()
-# TODO FigureCanvasAgg is non-interactive, and thus cannot be shown
+# ------------------------------------------------------------------------- inference
 
-def classify_image(image_path: Path) -> None:
-    if not MODEL_PATH.is_file():
-        raise FileNotFoundError(
-            f"Model not found at {MODEL_PATH}. Train one first with -train."
-        )
-    if not image_path.is_file():
-        raise FileNotFoundError(f"Image not found: {image_path}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(MODEL_PATH, map_location=device)
-    if checkpoint.get("architecture") != ARCHITECTURE:
+def load_model(model_path: Path, device: torch.device) -> tuple[ImageClassifier_resnet50, list[str]]:
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Model not found at {model_path}. Train one first with -train.")
+    checkpoint = torch.load(model_path, map_location=device)
+    # Older versions saved ResNet-50 weights under this incorrect label.
+    if checkpoint.get("architecture") not in {ARCHITECTURE, LEGACY_ARCHITECTURE}:
         raise ValueError(
-            "This model checkpoint was not created with VGG-19. "
+            "This model checkpoint was not created with ResNet-50. "
             "Train a new model with -train before classifying images."
         )
     classes = checkpoint["classes"]
-    model = ImageClassifier(len(classes)).to(device)
-    model.load_state_dict(checkpoint["model_state"])
+    model = ImageClassifier_resnet50(len(classes)).to(device)
+    model.load_checkpoint_state(checkpoint["model_state"])
     model.eval()
+    return model, classes
 
-    image_transform = make_transforms()
-    with Image.open(image_path) as image:
-        image_tensor = image_transform(image.convert("RGB")).unsqueeze(0).to(device)
 
+def predict_probabilities(
+    model: ImageClassifier_resnet50, image_path: Path, device: torch.device, tta: bool = True
+) -> torch.Tensor:
+    """Class probabilities for one image, averaged over the image and its mirror when ``tta``."""
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    tensor = make_transforms()(load_image(image_path))
+    batch = torch.stack([tensor, tensor.flip(-1)]) if tta else tensor.unsqueeze(0)
     with torch.no_grad():
-        probabilities = torch.softmax(model(image_tensor), dim=1)[0]
+        return torch.softmax(model(batch.to(device)), dim=1).mean(dim=0)
+
+
+def classify_image(image_path: Path, model_path: Path) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, classes = load_model(model_path, device)
+    probabilities = predict_probabilities(model, image_path, device)
     predicted_index = int(probabilities.argmax().item())
     print(
         f"Prediction: {classes[predicted_index]} "
@@ -274,12 +467,29 @@ def main() -> None:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("-train", action="store_true", help="train and save a new model")
     mode.add_argument("-image", type=Path, help="image file to classify")
+    parser.add_argument("--model", type=Path, default=MODEL_PATH, help="checkpoint path to write/read")
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--workers", type=int, default=4, help="DataLoader worker processes")
+    parser.add_argument(
+        "--freeze-epochs", type=int, default=FREEZE_EPOCHS,
+        help="epochs to train only the classifier head before unfreezing the backbone",
+    )
+    parser.add_argument("--backbone-lr", type=float, default=BACKBONE_LR)
+    parser.add_argument("--head-lr", type=float, default=HEAD_LR)
+    parser.add_argument(
+        "--patience", type=int, default=PATIENCE,
+        help="stop when balanced validation accuracy has not improved for this many epochs (0 disables)",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--no-amp", action="store_true", help="disable mixed precision on CUDA")
+    parser.add_argument("--no-mix", action="store_true", help="disable CutMix/MixUp augmentation")
     args = parser.parse_args()
 
     if args.train:
-        train_model()
+        train_model(args)
     else:
-        classify_image(args.image)
+        classify_image(args.image, args.model)
 
 
 if __name__ == "__main__":
