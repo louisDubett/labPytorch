@@ -1,20 +1,20 @@
 # install
-# Create a virtual environment 
+## Create a virtual environment 
 `python -m venv .venv`
 
-# Set up the virtual environment & data
+## Set up the virtual environment & data
 
-##  on Windows
+###  on Windows
 `.venv\Scripts\activate`
 
-## on macOS and Linux
+### on macOS and Linux
 `source .venv/bin/activate`
 
-## install all packages
+### install all packages
 `pip install -r requirements.txt` or manually with `pip install torch torchvision matplotlib` 
 
-## Get the dataset from hugging face
-TBD
+### Get the dataset from hugging face
+[labGlass](https://huggingface.co/datasets/louisDubett/labGlass/tree/main)
 
 # Generate model
 activate the virtual environment like above ('myenv\Scripts\activate')
@@ -27,8 +27,6 @@ run the command to generate model.pth
 # evaluate the model with test data
 `python evaluate_model.py -config config-accuracy-test-easy.xml`
 
-or
 
-`python evaluate_model.py -config config-accuracy-easy.xml`
 
 The evaluation produce a xml result file (with for each image OK/not OK) and a confusion matrix (named confusion.png)
