@@ -1,0 +1,1 @@
+.venv\Scripts\python C:\git\labPytorch\web_server.py
